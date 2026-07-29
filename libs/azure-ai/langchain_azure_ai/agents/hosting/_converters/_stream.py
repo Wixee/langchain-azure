@@ -4,10 +4,10 @@
 """Translate LangGraph streaming output into Responses API events.
 
 Drives :meth:`CompiledStateGraph.astream` with
-``stream_mode=["updates", "messages"]`` so the converter receives both
-per-token text chunks and per-node state updates. This lets us surface
-intermediate tool calls and tool-message results to the client in real
-time, not only the final assistant message.
+``stream_mode=["updates", "messages", "checkpoints"]`` so the converter
+receives per-token text chunks, per-node state updates, and the exact persisted
+checkpoint config for the invocation. Checkpoint events stay internal while
+tool calls and tool-message results are surfaced to the client in real time.
 
 Lifecycle per turn (a "turn" is everything appended after the last
 :class:`HumanMessage`):
@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from azure.ai.agentserver.responses import ResponseEventStream
 from langchain_core.messages import (
@@ -46,7 +46,9 @@ from langchain_core.messages import (
     BaseMessage,
     ToolMessage,
 )
+from langchain_core.runnables import RunnableConfig
 
+from .._responses import CheckpointRef, HostingRunnableConfig, TaskStorageManager
 from ._utils import extract_reasoning_summary_fragments, extract_text
 
 
@@ -55,8 +57,13 @@ async def stream_graph_to_events(
     stream: ResponseEventStream,
     *,
     cancellation_signal: asyncio.Event,
+    shutdown_signal: asyncio.Event | None = None,
 ) -> AsyncIterator[Any]:
     """Iterate the graph stream and yield Responses API events.
+
+    Each invocation handles one Responses turn by consuming the complete stream
+    from one LangGraph execution. A graph run may contain multiple supersteps
+    and checkpoint events, all of which are processed by this invocation.
 
     The caller is responsible for emitting ``response.created`` /
     ``response.in_progress`` before invoking this generator and
@@ -65,33 +72,64 @@ async def stream_graph_to_events(
 
     Args:
         graph_stream: The ``CompiledStateGraph.astream`` iterator,
-            opened with ``stream_mode=["updates", "messages"]``.
+            opened with ``stream_mode=["updates", "messages", "checkpoints"]``.
         stream: The :class:`ResponseEventStream` to emit events through.
         cancellation_signal: Set by the responses host when the request
-            is cancelled or the server is draining; iteration stops on set.
+            is cancelled; iteration stops on set.
+        shutdown_signal: Set when the host is draining. Iteration stops on set
+            so the caller can defer resilient work to the next lifetime.
 
     Yields:
         Responses API event payload dicts.
     """
-    state = _StreamState(stream)
+    converter = StreamConverter(stream)
+    task_storage = TaskStorageManager.from_stream(stream)
+
+    # Common timeline:
+    #   checkpoint(current state) -> execute superstep -> messages while nodes run
+    #   -> updates as nodes finish -> checkpoint(resulting state) -> next superstep
+    # At each checkpoint boundary, close partial Responses output and persist
+    # the Responses layer before requesting another LangGraph event.
+    def stop_requested() -> bool:
+        return cancellation_signal.is_set() or bool(
+            shutdown_signal is not None and shutdown_signal.is_set()
+        )
 
     async for chunk in graph_stream:
-        if cancellation_signal.is_set():
-            break
         mode, payload = _split_chunk(chunk)
+        if stop_requested() and mode != "checkpoints":
+            break
         if mode == "messages":
-            async for event in state.handle_message_chunk(payload):
+            async for event in converter.handle_message_chunk(payload):
                 yield event
+                if stop_requested():
+                    break
         elif mode == "updates":
-            async for event in state.handle_update(payload):
+            async for event in converter.handle_update(payload):
                 yield event
+                if stop_requested():
+                    break
+        elif mode == "checkpoints":
+            checkpoint_ref = _extract_checkpoint_ref(payload)
+            if checkpoint_ref is not None:
+                task_storage.store_checkpoint_ref(checkpoint_ref)
+            async for event in converter.checkpoint():
+                yield event
+                if stop_requested():
+                    break
+        if stop_requested():
+            break
 
-    async for event in state.flush():
+    async for event in converter.flush():
         yield event
 
 
-class _StreamState:
-    """Track in-flight builders and tool-call IDs already emitted."""
+class StreamConverter:
+    """Convert one LangGraph invocation stream into Responses events.
+
+    One converter is created per Responses call. It caches transient conversion
+    state, such as a partially built message or IDs used for deduplication.
+    """
 
     def __init__(self, stream: ResponseEventStream) -> None:
         self._stream = stream
@@ -103,12 +141,32 @@ class _StreamState:
         self._reasoning_buffer: list[str] = []
         self._emitted_tool_call_ids: set[str] = set()
         self._emitted_tool_output_call_ids: set[str] = set()
+        # AIMessage ids whose text was streamed token-by-token via
+        # ``stream_mode="messages"`` (LLM nodes). Used to avoid re-emitting the
+        # same assistant text as a whole ``message`` item when the node's
+        # ``updates`` payload arrives carrying the finished AIMessage.
+        self._streamed_message_ids: set[str] = set()
+        # AIMessage ids already surfaced as a whole ``message`` item from an
+        # ``updates`` payload (non-LLM nodes that return assistant text
+        # directly, e.g. a deterministic ``finalize`` node), so we emit each
+        # such message exactly once.
+        self._emitted_message_ids: set[str] = set()
+
+    async def checkpoint(self) -> AsyncIterator[Any]:
+        """Close partial output and emit an Agent Server checkpoint event."""
+        async for event in self.flush():
+            yield event
+        yield self._stream.checkpoint()
 
     async def handle_message_chunk(self, payload: Any) -> AsyncIterator[Any]:
         """Handle a payload from ``stream_mode="messages"``."""
         message_chunk = _extract_message_chunk(payload)
         if message_chunk is None:
             return
+
+        chunk_id = getattr(message_chunk, "id", None)
+        if isinstance(chunk_id, str) and chunk_id:
+            self._streamed_message_ids.add(chunk_id)
 
         for fragment in extract_reasoning_summary_fragments(message_chunk.content):
             async for event in self._emit_reasoning_fragment(fragment):
@@ -162,8 +220,9 @@ class _StreamState:
         the partial state returned by the node, which for
         ``MessagesState`` graphs contains a ``messages`` channel with the
         messages that node appended.
+
         """
-        for messages in _extract_node_messages(payload):
+        for node_name, messages in _extract_node_updates(payload):
             # Close any in-flight reasoning item and assistant message
             # before emitting the tool calls / tool outputs that just
             # arrived from this node, so output items stay ordered.
@@ -174,6 +233,8 @@ class _StreamState:
 
             for message in messages:
                 if isinstance(message, AIMessage):
+                    async for event in self._emit_ai_message_text(message):
+                        yield event
                     for call in message.tool_calls or []:
                         async for event in self._emit_tool_call(call):
                             yield event
@@ -209,6 +270,49 @@ class _StreamState:
         if self._reasoning_builder is not None:
             yield self._reasoning_builder.emit_done()
             self._reasoning_builder = None
+
+    async def _emit_ai_message_text(self, message: AIMessage) -> AsyncIterator[Any]:
+        """Emit a whole ``message`` item for assistant text from a node update.
+
+        LangGraph's ``stream_mode="messages"`` only streams tokens from chat
+        model invocations. A node that returns an :class:`AIMessage` with text
+        content *without* calling an LLM (e.g. a deterministic ``finalize``
+        node) therefore never produces ``messages``-mode chunks, so its text
+        would otherwise be dropped from the stream. Here we surface it as a
+        complete ``message`` output item.
+
+        The emission is deduplicated two ways so LLM-streamed text is not
+        doubled up: messages whose id was already streamed token-by-token
+        (tracked in ``_streamed_message_ids``) are skipped, as are messages
+        already emitted here (``_emitted_message_ids``).
+        """
+        text = extract_text(message.content)
+        if not text:
+            return
+        message_id = message.id
+        if isinstance(message_id, str) and message_id:
+            if message_id in self._streamed_message_ids:
+                return
+            if message_id in self._emitted_message_ids:
+                return
+            self._emitted_message_ids.add(message_id)
+        elif self._text_buffer:
+            # No id to dedup on, but text was already streamed this segment.
+            return
+
+        async for event in self._close_open_reasoning():
+            yield event
+        async for event in self._close_open_message():
+            yield event
+
+        message_builder = self._stream.add_output_item_message()
+        yield message_builder.emit_added()
+        text_builder = message_builder.add_text_content()
+        yield text_builder.emit_added()
+        yield text_builder.emit_delta(text)
+        yield text_builder.emit_text_done(text)
+        yield text_builder.emit_done()
+        yield message_builder.emit_done()
 
     async def _emit_tool_call(self, call: Any) -> AsyncIterator[Any]:
         name = str(call.get("name") or "")
@@ -262,6 +366,16 @@ def _split_chunk(chunk: Any) -> tuple[str | None, Any]:
     return "messages", chunk
 
 
+def _extract_checkpoint_ref(payload: Any) -> CheckpointRef | None:
+    """Extract the runnable config from a LangGraph checkpoint event."""
+    if not isinstance(payload, dict):
+        return None
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return None
+    return HostingRunnableConfig(cast(RunnableConfig, config)).checkpoint_ref
+
+
 def _extract_message_chunk(payload: Any) -> AIMessageChunk | None:
     """Pull an ``AIMessageChunk`` out of a ``messages`` payload."""
     if isinstance(payload, AIMessageChunk):
@@ -273,34 +387,35 @@ def _extract_message_chunk(payload: Any) -> AIMessageChunk | None:
     return None
 
 
-def _extract_node_messages(payload: Any) -> list[list[BaseMessage]]:
-    """Extract message lists from each node update inside an ``updates`` payload.
+def _extract_node_updates(payload: Any) -> list[tuple[str, list[BaseMessage]]]:
+    """Extract ``(node_name, messages)`` pairs from an ``updates`` payload.
 
     LangGraph 1.x emits ``{node_name: {"messages": [...]}}`` per node.
     Older releases occasionally surface the per-node update directly
-    (``{"messages": [...]}``); we accept both shapes.
+    (``{"messages": [...]}``); we accept both shapes and label the direct
+    form with an empty node name.
 
     Args:
         payload: The ``updates`` payload from ``graph.astream``.
 
     Returns:
-        A list of message lists, one per node update found.
+        A list of ``(node_name, messages)`` pairs, one per node update found.
     """
-    result: list[list[BaseMessage]] = []
+    result: list[tuple[str, list[BaseMessage]]] = []
     if not isinstance(payload, dict):
         return result
     # Per-node form: {node_name: {"messages": [...]}}
     saw_node_form = False
-    for value in payload.values():
+    for node_name, value in payload.items():
         if isinstance(value, dict) and "messages" in value:
             saw_node_form = True
             messages = value.get("messages") or []
             if isinstance(messages, list):
-                result.append(messages)
+                result.append((str(node_name), messages))
     if saw_node_form:
         return result
     # Direct form: {"messages": [...]}
     messages = payload.get("messages") or []
     if isinstance(messages, list):
-        result.append(messages)
+        result.append(("", messages))
     return result

@@ -43,7 +43,11 @@ try:
         ResponsesAgentServerHost,
         ResponsesServerOptions,
     )
-    from azure.ai.agentserver.responses.models._helpers import to_item
+    from azure.ai.agentserver.responses.models import Metadata
+    from azure.ai.agentserver.responses.models._helpers import (
+        get_conversation_id,
+        to_item,
+    )
 except ImportError as exc:
     raise ImportError(
         "The azure-ai-agentserver-responses package is required to use "
@@ -63,8 +67,13 @@ from ._converters import (
     emit_interrupts,
     is_messages_state_schema,
     parse_resume_command,
-    state_to_events,
     stream_graph_to_events,
+)
+from ._responses import (
+    CheckpointRef,
+    ConversationChainStorageManager,
+    HostingRunnableConfig,
+    TaskStorageManager,
 )
 
 if TYPE_CHECKING:
@@ -88,6 +97,8 @@ ResolvedConversationManagementMode = Literal[
     "langgraph_checkpoint",
 ]
 
+METADATA_STEERABLE_CONVERSATION = "foundry.agent.steerable_conversation"
+
 
 def _uses_langgraph_checkpointer(graph: "CompiledStateGraph") -> bool:
     return getattr(graph, "checkpointer", None) is not None
@@ -108,24 +119,6 @@ def _message_count(
     skip_call_ids: frozenset[str] = frozenset(),
 ) -> int:
     return len(build_messages_input(items, skip_call_ids=skip_call_ids)["messages"])
-
-
-def _response_field(response: Any, name: str) -> str | None:
-    value = getattr(response, name, None)
-    if value is None and hasattr(response, "get"):
-        value = response.get(name)
-    return value if isinstance(value, str) and value else None
-
-
-def _response_conversation_id(response: Any) -> str | None:
-    conversation = getattr(response, "conversation", None)
-    if conversation is None and hasattr(response, "get"):
-        conversation = response.get("conversation")
-    if isinstance(conversation, dict):
-        value = conversation.get("id")
-    else:
-        value = getattr(conversation, "id", None)
-    return value if isinstance(value, str) and value else None
 
 
 @experimental()
@@ -185,8 +178,9 @@ class ResponsesHostServer:
 
     Raises:
         ValueError: If the graph's state schema does not declare a
-            ``messages`` field. Override this class to host custom-state
-            graphs.
+            ``messages`` field, or if ``resilient_background=True`` is
+            configured without a LangGraph checkpointer. Override this class
+            to host custom-state graphs.
     """
 
     def __init__(
@@ -203,6 +197,24 @@ class ResponsesHostServer:
         self._validate_graph_schema(graph)
         self._graph = graph
         self._graph_has_checkpointer = _uses_langgraph_checkpointer(graph)
+        if (
+            app is None
+            and options is not None
+            and options.resilient_background
+            and not self._graph_has_checkpointer
+        ):
+            raise ValueError(
+                "ResponsesHostServer requires a LangGraph checkpointer when "
+                "resilient_background=True."
+            )
+        self._stream_modes: list[StreamMode] = ["updates", "messages"]
+        self._durability: Literal["sync"] | None = None
+        if self._graph_has_checkpointer:
+            self._stream_modes.append("checkpoints")
+            self._durability = "sync"
+        self._steerable_conversations = bool(
+            options is not None and options.steerable_conversations
+        )
 
         if app is not None:
             # Attach to an existing host (e.g. a multi-protocol mixin).
@@ -459,12 +471,13 @@ class ResponsesHostServer:
     ) -> RunnableConfig:
         """Build a LangGraph ``RunnableConfig`` for the request.
 
-        Sets ``configurable.thread_id`` so graphs compiled with a
-        checkpointer naturally continue the right conversation.
-        ``conversation_id`` is used directly when available. For
-        ``previous_response_id`` chains, the host resolves the root response
-        through the Responses provider when possible so all turns share the
-        same thread id.
+        Uses the root conversation ID or response ID as ``thread_id``. Linear
+        conversations preserve the stable thread ID and latest checkpoint in
+        ``context.conversation_chain_metadata``. Also exposes the full
+        :class:`ResponseContext` under
+        ``configurable.response_context`` so nodes can read per-attempt
+        transport facts (for example ``response_context.is_recovery``) that
+        are deliberately not part of the checkpointed graph state.
 
         Args:
             request: The parsed create-response request.
@@ -473,83 +486,44 @@ class ResponsesHostServer:
         Returns:
             A ``RunnableConfig`` dict.
         """
-        thread_id = await self._resolve_thread_id(request, context)
-        return {"configurable": {"thread_id": thread_id}}
-
-    def build_runnable_config_sync(
-        self,
-        request: CreateResponse,
-        context: ResponseContext,
-    ) -> RunnableConfig:
-        """Build a sync best-effort runnable config.
-
-        Prefer :meth:`build_runnable_config` in async request handling so
-        ``previous_response_id`` chains can be resolved through the Responses
-        provider.
-        """
-        previous_response_id = getattr(request, "previous_response_id", None)
-        thread_id: str
-        if isinstance(context.conversation_id, str) and context.conversation_id:
-            thread_id = context.conversation_id
-        elif isinstance(previous_response_id, str) and previous_response_id:
-            thread_id = f"resp-{previous_response_id}"
-        else:
-            thread_id = f"resp-{context.response_id}"
-        return {"configurable": {"thread_id": thread_id}}
-
-    async def _resolve_thread_id(
-        self,
-        request: CreateResponse,
-        context: ResponseContext,
-    ) -> str:
-        previous_response_id = getattr(request, "previous_response_id", None)
-        thread_id: str
-        if isinstance(context.conversation_id, str) and context.conversation_id:
-            thread_id = context.conversation_id
-        elif isinstance(previous_response_id, str) and previous_response_id:
-            resolved_thread_id = await self._thread_id_from_response_chain(
-                previous_response_id,
-                context,
+        if not self._graph_has_checkpointer:
+            thread_id = (
+                get_conversation_id(request)
+                or getattr(request, "previous_response_id", None)
+                or context.response_id
             )
-            thread_id = resolved_thread_id or f"resp-{previous_response_id}"
-        else:
-            thread_id = f"resp-{context.response_id}"
-        return thread_id
+            return HostingRunnableConfig.create(thread_id, context).runnable_config
 
-    async def _thread_id_from_response_chain(
+        checkpoint_ref = self._resolve_checkpoint_ref(context)
+        if checkpoint_ref is None:
+            # checkpoint_ref is missing in tasks or conversation chain and not the
+            # first conversation
+            # this must either be a storage issue or client passing a invalid request
+            if getattr(request, "previous_response_id", None):
+                raise RuntimeError(
+                    "Conversation chain metadata is required for a follow-up response"
+                )
+            thread_id = get_conversation_id(request) or context.response_id
+            return HostingRunnableConfig.create(thread_id, context).runnable_config
+
+        return HostingRunnableConfig.create_from_checkpoint(
+            checkpoint_ref,
+            context,
+        ).runnable_config
+
+    def _resolve_checkpoint_ref(
         self,
-        previous_response_id: str,
         context: ResponseContext,
-    ) -> str | None:
-        provider = getattr(context, "_provider", None)
-        if provider is None:
-            return None
+    ) -> CheckpointRef | None:
+        if context.is_recovery and context.persisted_response is not None:
+            task_storage = TaskStorageManager.from_response(context.persisted_response)
+            if task_storage.checkpoint_ref is not None:
+                return task_storage.checkpoint_ref
 
-        response_id: str | None = previous_response_id
-        seen: set[str] = set()
-        root_response_id: str | None = previous_response_id
-        while response_id and response_id not in seen:
-            seen.add(response_id)
-            try:
-                response = await provider.get_response(
-                    response_id,
-                    context=context.platform_context,
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to resolve response chain for thread mapping",
-                    exc_info=True,
-                )
-                return None
-
-            conversation_id = _response_conversation_id(response)
-            if conversation_id:
-                return conversation_id
-
-            root_response_id = response_id
-            response_id = _response_field(response, "previous_response_id")
-
-        return f"resp-{root_response_id}" if root_response_id else None
+        conversation_chain_storage = ConversationChainStorageManager(
+            context.conversation_chain_metadata
+        )
+        return conversation_chain_storage.checkpoint_ref
 
     def _resolve_conversation_management(self) -> ResolvedConversationManagementMode:
         return (
@@ -615,8 +589,10 @@ class ResponsesHostServer:
         Override this when wholesale customisation is needed. By default
         the method:
 
-        1. emits ``response.created`` / ``response.in_progress``,
-        2. checks for pending ``interrupt()`` pauses on the checkpointed
+             1. emits ``response.created`` / ``response.in_progress`` and durably
+                 checkpoints handler admission,
+                    2. resolves the LangGraph thread and checks for pending
+                     ``interrupt()`` pauses on the checkpointed
            thread and:
 
            - if the request contains an ``mcp_approval_response`` with
@@ -627,14 +603,14 @@ class ResponsesHostServer:
              ``function_call_output`` (rich) or
              ``mcp_approval_response{approve:true}`` (echo the
              interrupt value back),
-        3. drives the graph via :meth:`CompiledStateGraph.astream` or
+          3. drives the graph via :meth:`CompiledStateGraph.astream` or
            :meth:`CompiledStateGraph.ainvoke` depending on
            ``request.stream``,
-        4. emits the resulting output items, surfacing any new pending
+          4. emits the resulting output items, surfacing any new pending
            interrupts as a pair of ``function_call`` +
            ``mcp_approval_request`` items both keyed by the LangGraph
            interrupt id, and
-        5. emits ``response.completed`` (or ``response.failed`` /
+          5. emits ``response.completed`` (or ``response.failed`` /
            ``response.cancelled`` on error).
 
         Args:
@@ -645,77 +621,152 @@ class ResponsesHostServer:
         Yields:
             Responses API event payload dicts.
         """
-        stream = ResponseEventStream(response_id=context.response_id, request=request)
+        recovering = bool(context.is_recovery)
+        stream = self._new_stream(request, context)
+        task_storage = TaskStorageManager.from_stream(stream)
+        conversation_storage = ConversationChainStorageManager(
+            context.conversation_chain_metadata
+        )
         yield stream.emit_created()
+
+        # Shutdown and request cancellation are independent. Check shutdown
+        # first so resilient background work is deferred to the next lifetime.
+        if context.shutdown.is_set():
+            await context.exit_for_recovery()
+
+        if cancellation_signal.is_set():
+            yield stream.emit_in_progress()
+            if context.client_cancelled:
+                yield stream.emit_failed(
+                    code="cancelled",
+                    message="Request was cancelled.",
+                )
+            else:
+                yield stream.emit_completed()
+            return
+
         yield stream.emit_in_progress()
+
+        if not recovering:
+            # Persist handler admission before any provider or graph I/O.
+            yield stream.checkpoint()
 
         try:
             config = await self.build_runnable_config(request, context)
+            # Attach transient execution state after the overridable config
+            # hook. The public Responses handler contract supplies this exact
+            # Event as its third argument; Keeping it out of build_runnable_config's
+            # signature also preserves existing subclass overrides.
+            config = (
+                HostingRunnableConfig(config)
+                .with_cancellation_signal(cancellation_signal)
+                .runnable_config
+            )
 
-            # Detect a pause from a previous turn and try to resume it.
-            pending = await detect_pending_interrupts(self._graph, config)
             resume_command: Optional["Command"] = None
             consumed_call_ids: frozenset[str] = frozenset()
-            if pending:
-                # Rejection short-circuits the turn into ``response.failed``
-                # so a client-issued ``mcp_approval_response{approve:false}``
-                # is not silently dropped.
-                rejection_message = await self.detect_rejection(
-                    request, context, pending
-                )
-                if rejection_message is not None:
-                    yield stream.emit_failed(
-                        code="interrupt_rejected",
-                        message=rejection_message,
-                    )
-                    return
-                resume_command, consumed_call_ids = await self.build_resume_command(
-                    request, context, pending
-                )
+            graph_input: dict[str, Any] | Command | None
 
-            if pending and resume_command is None:
-                # Graph is paused but the client did not supply a matching
-                # ``function_call_output``. Re-emitting the pending
-                # interrupts (instead of driving the graph with fresh
-                # input) keeps the conversation in a recoverable state and
-                # avoids sending an unbalanced message list — with a
-                # dangling ``AskHuman``-style tool_call — to the model.
-                async for event in emit_interrupts(pending, stream):
-                    yield event
-                yield stream.emit_completed()
-                return
-
-            if resume_command is not None:
-                graph_input: Any = resume_command
+            if recovering:
+                # Crash-recovered re-entry. The graph's own persistent
+                # checkpointer holds the mid-turn state, so resume it (input
+                # ``None``) rather than re-injecting the original input. If the
+                # thread has no checkpoint yet (crash before the first node
+                # committed), fall back to a fresh run.
+                graph_input = await self._resume_graph_input(
+                    request,
+                    context,
+                )
             else:
-                graph_input = await self.build_input(
-                    request, context, skip_call_ids=consumed_call_ids
-                )
+                # Detect a pause from a previous turn and try to resume it.
+                pending = await detect_pending_interrupts(self._graph, config)
+                if pending:
+                    # HITL:
+                    # Rejection short-circuits the turn into ``response.failed``
+                    # so a client-issued ``mcp_approval_response{approve:false}``
+                    # is not silently dropped.
+                    rejection_message = await self.detect_rejection(
+                        request, context, pending
+                    )
+                    if rejection_message is not None:
+                        yield stream.emit_failed(
+                            code="interrupt_rejected",
+                            message=rejection_message,
+                        )
+                        return
+                    resume_command, consumed_call_ids = await self.build_resume_command(
+                        request, context, pending
+                    )
 
-            if context.mode_flags.stream:
-                stream_modes: list[StreamMode] = ["updates", "messages"]
-                graph_stream = self._graph.astream(
-                    graph_input,
-                    config=config,
-                    stream_mode=stream_modes,
-                )
-                async for event in stream_graph_to_events(
-                    graph_stream, stream, cancellation_signal=cancellation_signal
-                ):
-                    yield event
-                if cancellation_signal.is_set():
+                if pending and resume_command is None:
+                    # Graph is paused but the client did not supply a matching
+                    # ``function_call_output``. Re-emitting the pending
+                    # interrupts (instead of driving the graph with fresh
+                    # input) keeps the conversation in a recoverable state and
+                    # avoids sending an unbalanced message list — with a
+                    # dangling ``AskHuman``-style tool_call — to the model.
+                    async for event in emit_interrupts(pending, stream):
+                        yield event
+                    ref = HostingRunnableConfig(config).checkpoint_ref
+                    if ref is not None:
+                        task_storage.store_checkpoint_ref(ref)
+                        await conversation_storage.persist_checkpoint_ref(ref)
+                    yield stream.emit_completed()
+                    return
+
+                if resume_command is not None:
+                    graph_input = resume_command
+                else:
+                    graph_input = await self.build_input(
+                        request, context, skip_call_ids=consumed_call_ids
+                    )
+
+            graph_stream = self._graph.astream(
+                graph_input,
+                config=config,
+                stream_mode=self._stream_modes,
+                durability=self._durability,
+            )
+            async for event in stream_graph_to_events(
+                graph_stream,
+                stream,
+                cancellation_signal=cancellation_signal,
+                shutdown_signal=context.shutdown,
+            ):
+                yield event
+            checkpoint_ref = task_storage.checkpoint_ref
+            if checkpoint_ref is not None:
+                await conversation_storage.persist_checkpoint_ref(checkpoint_ref)
+            if context.shutdown.is_set():
+                await context.exit_for_recovery()
+            if cancellation_signal.is_set():
+                if context.client_cancelled:
                     yield stream.emit_failed(
                         code="cancelled",
                         message="Request was cancelled.",
                     )
-                    return
-            else:
-                state = await self._graph.ainvoke(graph_input, config=config)
-                async for event in state_to_events(state, stream):
-                    yield event
+                else:
+                    # Steering supersedes this turn without cancelling it.
+                    # Preserve its checkpointed partial output and let the
+                    # queued turn begin from this response as its parent.
+                    yield stream.emit_completed()
+                return
 
             # Surface any interrupts the graph paused on during this turn.
-            new_pending = await detect_pending_interrupts(self._graph, config)
+            post_run_config = config
+            checkpoint_ref = task_storage.checkpoint_ref
+            if checkpoint_ref is not None:
+                # The graph has checkpointed its HITL state, so persist the
+                # reference for the next turn.
+                post_run_config = (
+                    HostingRunnableConfig(config)
+                    .with_checkpoint_ref(checkpoint_ref)
+                    .runnable_config
+                )
+            new_pending = await detect_pending_interrupts(
+                self._graph,
+                post_run_config,
+            )
             if new_pending:
                 async for event in emit_interrupts(new_pending, stream):
                     yield event
@@ -724,6 +775,63 @@ class ResponsesHostServer:
         except Exception as exc:  # noqa: BLE001
             logger.exception("LangGraph response handler failed")
             yield stream.emit_failed(code="internal_error", message=str(exc))
+
+    # ------------------------------------------------------------------
+    # Recovery helpers (resilient background responses)
+    # ------------------------------------------------------------------
+
+    def _new_stream(
+        self, request: CreateResponse, context: ResponseContext
+    ) -> ResponseEventStream:
+        """Create the event stream, seeding it on a recovered entry.
+
+        On a crash-recovered entry the framework hands us the last
+        resiliently-persisted snapshot as ``context.persisted_response``. We
+        seed the stream from it so the phases already checkpointed before the
+        crash are present in ``stream.response.output`` (and the output-index
+        allocator continues past them). The subsequent ``response.in_progress``
+        then carries those items as the client-visible reset point, and the
+        graph — resumed from its own checkpoint — only appends the remaining
+        phases. On a fresh entry we build an empty envelope from the request.
+        """
+        if context.is_recovery and context.persisted_response is not None:
+            stream = ResponseEventStream(
+                response_id=context.response_id,
+                response=context.persisted_response,
+            )
+        else:
+            stream = ResponseEventStream(
+                response_id=context.response_id,
+                request=request,
+            )
+
+        metadata = dict(stream.response.metadata or {})
+        metadata[METADATA_STEERABLE_CONVERSATION] = str(
+            self._steerable_conversations
+        ).lower()
+        stream.response.metadata = Metadata(metadata)
+        return stream
+
+    async def _resume_graph_input(
+        self,
+        request: CreateResponse,
+        context: ResponseContext,
+    ) -> dict[str, Any] | None:
+        """Choose the graph input for a recovered entry.
+
+        A checkpoint stored on the persisted Response was committed for this
+        response, so return ``None`` to resume from it. Without one, replay the
+        request input. This intentionally provides at-least-once execution
+        across the LangGraph and Responses checkpoint stores.
+        """
+        checkpoint_ref = TaskStorageManager.from_response(
+            context.persisted_response
+        ).checkpoint_ref
+        if checkpoint_ref is not None:
+            logger.debug("Recovery: resuming graph from persisted checkpoint")
+            return None
+        logger.debug("Recovery: replaying request input")
+        return await self.build_input(request, context)
 
     # ------------------------------------------------------------------
     # Internal — registered as the @response_handler. Wraps handle_create

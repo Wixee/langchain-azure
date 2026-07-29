@@ -67,7 +67,27 @@ def make_checkpointed_echo_graph() -> CompiledStateGraph:
     return builder.compile(checkpointer=InMemorySaver())
 
 
-def make_streaming_graph() -> CompiledStateGraph:
+def make_checkpointed_two_node_graph() -> CompiledStateGraph:
+    """Return a checkpointed graph with distinct plan and research updates."""
+
+    async def plan(state: _MessagesState) -> dict[str, Any]:
+        return {"messages": [AIMessage(content="plan")]}
+
+    async def research(state: _MessagesState) -> dict[str, Any]:
+        return {"messages": [AIMessage(content="research")]}
+
+    builder = StateGraph(_MessagesState)
+    builder.add_node("plan", plan)
+    builder.add_node("research", research)
+    builder.add_edge(START, "plan")
+    builder.add_edge("plan", "research")
+    builder.add_edge("research", END)
+    return builder.compile(checkpointer=InMemorySaver())
+
+
+def make_streaming_graph(
+    captured_config: dict[str, Any] | None = None,
+) -> CompiledStateGraph:
     """Return a graph-shaped fixture that emits chunked tokens."""
     tokens = ["Hello", ", ", "world", "!"]
 
@@ -77,7 +97,9 @@ def make_streaming_graph() -> CompiledStateGraph:
         async def astream(
             self, *args: Any, **kwargs: Any
         ) -> AsyncIterator[AIMessageChunk]:
-            del args, kwargs
+            del args
+            if captured_config is not None:
+                captured_config.update(kwargs["config"])
             for token in tokens:
                 yield AIMessageChunk(content=token)
 
