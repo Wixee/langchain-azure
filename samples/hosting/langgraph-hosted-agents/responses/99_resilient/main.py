@@ -15,11 +15,15 @@ Graph shape::
 Optional environment variables:
 
     PORT               optional, defaults to 8088
+    CHECKPOINT_BACKEND optional ``sqlite`` or ``foundry``. Defaults to SQLite
+                       locally and Foundry state store when hosted.
     CHECKPOINT_DB      optional path to the LangGraph checkpoint SQLite file.
                        Defaults to ``checkpoints.sqlite`` in the working
                        directory locally, or ``$HOME/checkpoints.sqlite`` when
                        hosted on Foundry, since only ``$HOME`` persists across a
                        hosted restart.
+    FOUNDRY_CHECKPOINT_TTL_SECONDS optional item TTL for Foundry checkpoints.
+                                   Defaults to 30 days; ``-1`` disables expiry.
     STEERABLE_CONVERSATIONS optional boolean (default false) controlling
                             whether newer turns can steer active conversations.
     FOUNDRY_PROJECT_ENDPOINT required project endpoint for the model.
@@ -46,12 +50,15 @@ import asyncio
 import json
 import os
 import signal
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated, Any, TypedDict
 
 from azure.ai.agentserver.core import AgentConfig
 from azure.ai.agentserver.responses import ResponsesServerOptions
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
 from dotenv import load_dotenv
 from langchain_azure_ai.agents.hosting import ResponsesHostServer
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -59,11 +66,14 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolM
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
+
+from foundry_checkpointer import FoundryCheckpointSaver
 
 load_dotenv()
 
@@ -93,12 +103,61 @@ def _install_otel_langgraph_callback_compatibility() -> None:
 
 
 def _resolve_checkpoint_db() -> str:
+    if checkpoint_db := os.environ.get("CHECKPOINT_DB"):
+        return checkpoint_db
     if AgentConfig.from_env().is_hosted:
         return os.path.join(os.path.expanduser("~"), "checkpoints.sqlite")
     return "checkpoints.sqlite"
 
 
-_CHECKPOINT_DB = _resolve_checkpoint_db()
+def _resolve_checkpoint_backend() -> str:
+    configured = os.environ.get("CHECKPOINT_BACKEND")
+    if configured is None:
+        return "foundry" if AgentConfig.from_env().is_hosted else "sqlite"
+    backend = configured.strip().lower()
+    if backend not in {"foundry", "sqlite"}:
+        raise ValueError(
+            "CHECKPOINT_BACKEND must be 'foundry' or 'sqlite', "
+            f"got {configured!r}"
+        )
+    return backend
+
+
+def _resolve_foundry_checkpoint_ttl() -> int:
+    configured = os.environ.get("FOUNDRY_CHECKPOINT_TTL_SECONDS")
+    if configured is None:
+        return 30 * 24 * 60 * 60
+    try:
+        ttl_seconds = int(configured)
+    except ValueError as exc:
+        raise ValueError(
+            "FOUNDRY_CHECKPOINT_TTL_SECONDS must be an integer"
+        ) from exc
+    if ttl_seconds != -1 and ttl_seconds < 1:
+        raise ValueError(
+            "FOUNDRY_CHECKPOINT_TTL_SECONDS must be -1 or a positive integer"
+        )
+    return ttl_seconds
+
+
+@asynccontextmanager
+async def open_checkpointer() -> AsyncIterator[BaseCheckpointSaver]:
+    if _resolve_checkpoint_backend() == "foundry":
+        endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"].rstrip("/")
+        async with AsyncDefaultAzureCredential() as credential:
+            yield FoundryCheckpointSaver(
+                credential=credential,
+                endpoint=endpoint,
+                item_ttl_seconds=_resolve_foundry_checkpoint_ttl(),
+            )
+        return
+
+    async with AsyncSqliteSaver.from_conn_string(
+        _resolve_checkpoint_db()
+    ) as checkpointer:
+        yield checkpointer
+
+
 _AZURE_AI_SCOPE = "https://ai.azure.com/.default"
 _SENSITIVE_TOOLS = {"book_trip"}
 _SYSTEM_PROMPT = """You are a concise trip-planning assistant.
@@ -303,7 +362,7 @@ async def amain() -> None:
         steerable_conversations=env_bool("STEERABLE_CONVERSATIONS"),
     )
     model = build_real_model()
-    async with AsyncSqliteSaver.from_conn_string(_CHECKPOINT_DB) as checkpointer:
+    async with open_checkpointer() as checkpointer:
         graph = build_graph(checkpointer, model)
         server = ResponsesHostServer(graph, options=options)
         await server.run_async(port=int(os.environ.get("PORT", "8088")))

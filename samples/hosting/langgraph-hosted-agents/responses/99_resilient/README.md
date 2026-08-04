@@ -1,10 +1,15 @@
-# Sample 99 — Resilient background Responses + LangGraph checkpointer
+# Sample 99 — Resilient background Responses + durable LangGraph checkpointers
 
 > **Work in progress / experimental.** This sample is the sandbox for
 > integrating the **resilient background responses** feature of
 > `azure-ai-agentserver-responses` with LangGraph's native checkpointer,
 > and for the corresponding changes to
 > `langchain_azure_ai.agents.hosting.ResponsesHostServer`.
+
+Hosted deployments use the server-backed `FoundryStateStore` through this
+sample's `FoundryCheckpointSaver`, so checkpoints remain available across
+container replacement and multiple host instances. Local runs keep
+`AsyncSqliteSaver` as a zero-setup fallback.
 
 ## What this sample demonstrates
 
@@ -25,8 +30,8 @@ client displays the tool arguments and enables **Approve** and **Deny**.
 
 1. **[done] Baseline** — deterministic numeric pipeline, running locally.
 2. **[done] Enable resilience** — `ResponsesServerOptions(resilient_background=True)`
-   plus a persistent LangGraph checkpointer (`AsyncSqliteSaver`) so graph
-   state survives a process restart.
+   plus a persistent LangGraph checkpointer. Foundry hosting uses the durable
+   state store; local development defaults to SQLite.
 3. **[done] Recovery-aware hosting** — `ResponsesHostServer.handle_create`
    resumes from the exact persisted LangGraph `thread_id` and `checkpoint_id`,
    seeds the reconnecting stream from `context.persisted_response`, and runs
@@ -171,11 +176,11 @@ internally; it is not exposed as a command-line option. When steering is
 enabled, sending during active output immediately creates a replacement
 response whose `previous_response_id` is the active response.
 
-The graph is compiled with a persistent checkpointer so state survives a
-restart:
+The graph is compiled with the selected persistent checkpointer so state
+survives a restart:
 
 ```python
-async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
+async with open_checkpointer() as checkpointer:
     graph = _build_graph(checkpointer)
     ...
 ```
@@ -183,11 +188,32 @@ async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
 `AsyncSqliteSaver` (not the sync `SqliteSaver`) is required because the host
 drives the graph with the async API (`astream` / `aget_state`).
 
+### Foundry-backed LangGraph checkpoints
+
+`FoundryCheckpointSaver` implements LangGraph's async `BaseCheckpointSaver`
+contract using the mapping from the Foundry durable state-store guide:
+
+| LangGraph concept | Foundry state store mapping |
+| --- | --- |
+| Thread | Store `langGraphCheckpoints/{thread_id}` |
+| Checkpoint | Item `{checkpoint_ns}/{checkpoint_id}` |
+| Pending write | Item `{checkpoint_ns}/writes/{checkpoint_id}/{task_id}/{index}` |
+| Latest/history lookup | `kind`, `ns`, `source`, and `step` tags |
+| End-user boundary | `user_isolation=True` |
+
+The saver uses LangGraph's serializer and Base64-encodes its binary output into
+the JSON item value. Each SDK client is closed after its operation, while one
+async Azure credential is reused for the lifetime of the server. Foundry state
+store item values are limited to 1 MB; keep large artifacts outside graph
+state and checkpoint references to them instead.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CHECKPOINT_DB` | `checkpoints.sqlite` (cwd) locally; `$HOME/checkpoints.sqlite` when hosted | SQLite file backing the LangGraph checkpointer. On Foundry the working directory is ephemeral and lost on restart, so the DB defaults to `$HOME` — the only persisted path — otherwise crash recovery would have no state to resume from. An explicit value always wins. Foundry is detected via `FOUNDRY_HOSTING_ENVIRONMENT`. |
+| `CHECKPOINT_BACKEND` | `sqlite` locally; `foundry` when hosted | Selects the LangGraph checkpoint backend. Set explicitly to override environment detection. |
+| `CHECKPOINT_DB` | `checkpoints.sqlite` (cwd) locally; `$HOME/checkpoints.sqlite` when hosted | SQLite file used only by the `sqlite` backend. An explicit value always wins. |
+| `FOUNDRY_CHECKPOINT_TTL_SECONDS` | `2592000` (30 days) | Foundry store item TTL. Writes renew the TTL; reads do not. Set `-1` for no expiry. The value is fixed when each thread store is first created. |
 | `AGENTSERVER_STATE_ROOT` | `~/.agentserver` | Root of the local file-backed resilient task/response/stream stores. |
 | `TOKEN_DELAY_SECONDS` | `0.05` | Default sleep in seconds between fake-model tokens. The client can override it per response with `--tokendelay`. |
 | `STEERABLE_CONVERSATIONS` | `false` | Enables or disables steerable conversations for the server deployment. |
@@ -206,20 +232,26 @@ Follow the instructions in the [Running the Agent Host
 Locally](../../README.md#running-the-agent-host-locally) section of the
 README in the parent directory to run the agent host.
 
-Quick local start (no Azure login or endpoint needed):
+Create `.env` from `.env.example`, replace the Foundry project placeholder,
+and choose the checkpoint backend. `DefaultAzureCredential` is used for both
+the model and state store, so authenticate with Azure before starting locally.
 
 ```bash
 uv sync
 uv run python main.py
 ```
 
-To use a real model, set the project endpoint and deployment name in `.env`,
-then start the server with the same command:
+To exercise the new server-backed checkpointer locally, use:
 
 ```dotenv
 FOUNDRY_PROJECT_ENDPOINT="https://<account>.services.ai.azure.com/api/projects/<project>"
 AZURE_AI_MODEL_DEPLOYMENT_NAME="gpt-4.1-mini"
+CHECKPOINT_BACKEND="foundry"
 ```
+
+Set `CHECKPOINT_BACKEND="sqlite"` for a local file-backed checkpoint database.
+Hosted deployments default to `foundry`, so `azure.yaml` needs no additional
+checkpoint setting.
 
 > **Install note.** The resilience API
 > (`resilient_background`, `context.is_recovery`, `context.persisted_response`,

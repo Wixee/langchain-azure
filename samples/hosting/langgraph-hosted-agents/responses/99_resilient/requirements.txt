@@ -10,8 +10,8 @@ azure-identity>=1.25.1
 httpx>=0.28.1
 
 langgraph>=1.2.8
-# Persistent LangGraph checkpointer so graph state survives a process restart
-# (required for coherent crash recovery — an in-memory saver would lose it).
+# Zero-setup local fallback; hosted runs use azure-ai-agentserver-core's
+# Foundry state store through foundry_checkpointer.py.
 langgraph-checkpoint-sqlite>=3.1.0
 langchain-openai>=1.1.11
 
