@@ -5,9 +5,7 @@ description = "Azure CosmosDB integrations for LangChain and LangGraph, includin
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
-authors = [
-  { name = "Aayush Kataria", email = "akataria@microsoft.com" },
-]
+authors = [{ name = "Aayush Kataria", email = "akataria@microsoft.com" }]
 maintainers = [
   { name = "Aayush Kataria", email = "akataria@microsoft.com" },
   { name = "Theo van Kraay", email = "Theo.van@microsoft.com" },
@@ -70,11 +68,7 @@ ignore_missing_imports = true
 disable_error_code = "typeddict-item, return-value, valid-type, index, attr-defined, var-annotated"
 
 [tool.pytest.ini_options]
-addopts = [
-  "--durations=5",
-  "--strict-config",
-  "--strict-markers",
-]
+addopts = ["--durations=5", "--strict-config", "--strict-markers"]
 markers = [
   "compile: mark placeholder test used to compile integration tests without running them",
   "requires: mark tests as requiring a specific library",
@@ -91,12 +85,17 @@ select = ["E", "F", "I", "D"]
 convention = "google"
 
 [tool.uv]
-constraint-dependencies = ["urllib3>=2.6.3", "cryptography>=46.0.7", "aiohttp>=3.13.4", "pyjwt>=2.12.0"]
+constraint-dependencies = [
+  "urllib3>=2.6.3",
+  "cryptography>=46.0.7",
+  "aiohttp>=3.13.4",
+  "pyjwt>=2.12.0",
+]
 default-groups = ["typing"]
 
 [tool.uv.sources]
 langchain-core = { git = "https://github.com/langchain-ai/langchain.git", subdirectory = "libs/core" }
-langchain-azure-ai = { path = "../azure-ai", editable = true }
+langchain-azure-ai = { workspace = true }
 
 [dependency-groups]
 codespell = ["codespell~=2.2"]
