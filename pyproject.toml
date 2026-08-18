@@ -7,7 +7,6 @@ dependencies = []
 
 [tool.uv]
 package = false
-exclude-newer = "7 days"
 constraint-dependencies = [
   "urllib3>=2.6.3",
   "cryptography>=46.0.7",
