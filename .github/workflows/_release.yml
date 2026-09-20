@@ -127,15 +127,12 @@ jobs:
         shell: bash
         working-directory: ${{ inputs.working-directory }}
         run: |
-          download_package() {
-            uvx --python "$PYTHON_VERSION" pip download \
-              --index-url https://test.pypi.org/simple/ \
-              --no-deps \
-              --only-binary=:all: \
-              --dest dist \
-              "$PKG_NAME==$VERSION"
-          }
-          download_package || { sleep 5; download_package; }
+          uvx --python "$PYTHON_VERSION" pip download \
+            --index-url https://test.pypi.org/simple/ \
+            --no-deps \
+            --only-binary=:all: \
+            --dest dist \
+            "$PKG_NAME==$VERSION"
 
       - name: Import package from TestPyPI
         shell: bash
