@@ -61,6 +61,7 @@ except ImportError as exc:
     ) from exc
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from langchain_azure_ai._api.base import experimental
 from langchain_azure_ai.agents.hosting import (
@@ -83,11 +84,22 @@ from ._converters import (
 )
 from ._responses import (
     CONVERSATION_CHECKPOINT_KEY,
+    METADATA_LANGGRAPH_CHECKPOINT_ID,
+    METADATA_LANGGRAPH_THREAD_ID,
     CheckpointRef,
     ConversationChainStoreProtocol,
     FoundryConversationChainStore,
     HostingRunnableConfig,
     TaskStorageManager,
+)
+from ._responses.branching import (
+    BRANCH_MODE,
+    BRANCH_MODE_HEADER,
+    BRANCH_MODE_METADATA,
+    BranchingAdmissionMiddleware,
+    BranchingError,
+    ResponseBranchStore,
+    StrictCheckpointSaver,
 )
 
 if TYPE_CHECKING:
@@ -303,6 +315,10 @@ class ResponsesHostServer:
             atomic replacement, and explicit failures. Defaults to
             :class:`FoundryConversationChainStore`, which uses one
             :class:`FoundryStateStore` namespace per conversation chain.
+        enable_response_branching: Restore the exact parent response checkpoint
+            for response-ID chains. Defaults to ``False``, preserving legacy
+            behavior. Requires a graph compiled with a history-preserving
+            checkpoint saver; the host does not create a saver automatically.
         prefix: URL prefix for response routes (e.g. ``"/v1"``).
         applicationinsights_connection_string: Forwarded to
             :class:`AgentServerHost`.
@@ -311,8 +327,9 @@ class ResponsesHostServer:
     Raises:
         ValueError: If the graph's state schema does not declare a
             ``messages`` field, or if ``resilient_background=True`` is
-            configured without a LangGraph checkpointer. Override this class
-            to host custom-state graphs.
+            configured without a LangGraph checkpointer, or if branching is
+            enabled without a checkpoint saver. Override this class to host
+            custom-state graphs.
     """
 
     def __init__(
@@ -323,6 +340,7 @@ class ResponsesHostServer:
         options: Optional[ResponsesServerOptions] = None,
         store: Optional[ResponseProviderProtocol] = None,
         conversation_chain_store: Optional[ConversationChainStoreProtocol] = None,
+        enable_response_branching: bool = False,
         prefix: str = "",
         applicationinsights_connection_string: Optional[str] = None,
         graceful_shutdown_timeout: Optional[int] = None,
@@ -330,11 +348,34 @@ class ResponsesHostServer:
         self._validate_graph_schema(graph)
         self._graph = graph
         self._graph_has_checkpointer = _uses_langgraph_checkpointer(graph)
+        if enable_response_branching and not isinstance(
+            getattr(graph, "checkpointer", None), BaseCheckpointSaver
+        ):
+            raise ValueError(
+                "enable_response_branching=True requires a graph compiled with "
+                "a checkpoint saver. Configure checkpointer when creating the graph."
+            )
+        self._enable_response_branching = enable_response_branching
         self._conversation_chain_store = (
             conversation_chain_store
             if conversation_chain_store is not None
             else FoundryConversationChainStore()
         )
+        self._branch_store = ResponseBranchStore(self._conversation_chain_store)
+        if enable_response_branching and app is not None:
+            raise ValueError(
+                "enable_response_branching=True cannot validate an attached app's "
+                "effective steering settings. Let ResponsesHostServer create the app."
+            )
+        if (
+            enable_response_branching
+            and options is not None
+            and options.steerable_conversations
+        ):
+            raise ValueError(
+                "enable_response_branching=True does not support "
+                "steerable_conversations=True."
+            )
         if (
             app is None
             and options is not None
@@ -383,6 +424,9 @@ class ResponsesHostServer:
 
         self._log_conversation_management_selection()
         _install_recovery_stream_lock_workaround(self._app)
+        self._app.add_middleware(
+            BranchingAdmissionMiddleware, enabled=enable_response_branching
+        )
 
         # Wire the create handler.
         self._app.response_handler(self._handle_create_async_gen)
@@ -632,6 +676,21 @@ class ResponsesHostServer:
         Returns:
             A ``RunnableConfig`` dict.
         """
+        if self._uses_response_branching(request, context):
+            parent_id = request.get("previous_response_id")
+            if not parent_id:
+                return HostingRunnableConfig.create(
+                    _scope_thread_id(context.response_id, context), context
+                ).runnable_config
+            ref = await self._branch_store.prepare(
+                response_key=_scope_thread_id(context.response_id, context),
+                parent_key=_scope_thread_id(parent_id, context),
+                parent_id=parent_id,
+                context=context,
+            )
+            return HostingRunnableConfig.create_from_checkpoint(
+                ref, context
+            ).runnable_config
         thread_id = await self._resolve_thread_id(request, context)
         if not self._graph_has_checkpointer:
             return HostingRunnableConfig.create(thread_id, context).runnable_config
@@ -748,6 +807,24 @@ class ResponsesHostServer:
             else "responses_history"
         )
 
+    def _uses_response_branching(
+        self, request: CreateResponse, context: ResponseContext
+    ) -> bool:
+        if context.is_recovery:
+            headers = getattr(context, "client_headers", {})
+            mode = headers.get(BRANCH_MODE_HEADER) if isinstance(headers, dict) else None
+            if mode not in {None, BRANCH_MODE}:
+                raise BranchingError(
+                    "invalid_branch_state", "The admitted execution mode is invalid."
+                )
+            enabled = mode == BRANCH_MODE
+        else:
+            enabled = self._enable_response_branching
+        conversation_id = get_conversation_id(request) or context.conversation_id
+        return enabled and not (
+            isinstance(conversation_id, str) and conversation_id
+        )
+
     def _log_conversation_management_selection(self) -> None:
         mode = self._resolve_conversation_management()
         logger.debug(
@@ -845,6 +922,23 @@ class ResponsesHostServer:
         )
         yield stream.emit_created()
 
+        try:
+            branching = self._uses_response_branching(request, context)
+        except BranchingError as exc:
+            yield stream.emit_in_progress()
+            yield stream.emit_failed(code=exc.code, message=str(exc))
+            return
+        branch_root = branching and not request.get("previous_response_id")
+        if branching:
+            stream.internal_metadata[BRANCH_MODE_METADATA] = BRANCH_MODE
+        if branch_root and (recovering or context.shutdown.is_set()):
+            yield stream.emit_in_progress()
+            yield stream.emit_failed(
+                code="root_recovery_unsupported",
+                message="Interrupted root responses are not resumed. Submit a new root request.",
+            )
+            return
+
         # Shutdown and request cancellation are independent. Check shutdown
         # first so resilient background work is deferred to the next lifetime.
         if context.shutdown.is_set():
@@ -869,6 +963,15 @@ class ResponsesHostServer:
 
         usage = UsageAccumulator()
         try:
+            graph = self._graph
+            if branching:
+                if not isinstance(graph.checkpointer, BaseCheckpointSaver):
+                    raise BranchingError(
+                        "invalid_branch_state", "Recovery requires a checkpoint saver."
+                    )
+                graph = graph.copy(
+                    {"checkpointer": StrictCheckpointSaver(graph.checkpointer)}
+                )
             config = await self.build_runnable_config(request, context)
             # Attach transient execution state after the overridable config
             # hook. The public Responses handler contract supplies this exact
@@ -884,6 +987,24 @@ class ResponsesHostServer:
             consumed_call_ids: frozenset[str] = frozenset()
             graph_input: dict[str, Any] | Command | None
             checkpoint_ref = task_storage.checkpoint_ref if recovering else None
+
+            if branching and recovering:
+                progress_recorded = any(
+                    key in stream.internal_metadata
+                    for key in (
+                        METADATA_LANGGRAPH_THREAD_ID,
+                        METADATA_LANGGRAPH_CHECKPOINT_ID,
+                    )
+                )
+                origin_ref = HostingRunnableConfig(config).checkpoint_ref
+                if progress_recorded and (
+                    checkpoint_ref is None
+                    or origin_ref is None
+                    or checkpoint_ref.thread_id != origin_ref.thread_id
+                ):
+                    raise BranchingError(
+                        "invalid_branch_state", "The recorded execution checkpoint is invalid."
+                    )
 
             if checkpoint_ref is not None:
                 # Crash-recovered re-entry. The graph's own persistent
@@ -903,7 +1024,7 @@ class ResponsesHostServer:
                 if recovering:
                     logger.debug("Recovery: replaying request input")
                 # Detect a pause from a previous turn and try to resume it.
-                pending = await detect_pending_interrupts(self._graph, config)
+                pending = await detect_pending_interrupts(graph, config)
                 if pending:
                     _add_request_hosting_features(HostingFeature.HITL)
                     # HITL:
@@ -940,6 +1061,13 @@ class ResponsesHostServer:
                             CONVERSATION_CHECKPOINT_KEY,
                             ref.to_dict(),
                         )
+                    if branching:
+                        await self._branch_store.publish(
+                            _scope_thread_id(context.response_id, context),
+                            stream,
+                            ref,
+                            paused=True,
+                        )
                     yield stream.emit_completed()
                     return
 
@@ -952,7 +1080,7 @@ class ResponsesHostServer:
 
             active_interrupts: list["Interrupt"] = []
             graph_stream = track_pending_interrupts(
-                self._graph.astream(
+                graph.astream(
                     graph_input,
                     config=config,
                     stream_mode=self._stream_modes,
@@ -976,6 +1104,13 @@ class ResponsesHostServer:
                     checkpoint_ref.to_dict(),
                 )
             if context.shutdown.is_set():
+                if branch_root:
+                    yield stream.emit_failed(
+                        code="root_recovery_unsupported",
+                        message="Interrupted root responses are not resumed. Submit a new root request.",
+                        usage=usage.response_usage,
+                    )
+                    return
                 await context.exit_for_recovery()
             if cancellation_signal.is_set():
                 if context.client_cancelled:
@@ -1001,12 +1136,26 @@ class ResponsesHostServer:
                 async for event in emit_interrupts(new_pending, stream):
                     yield event
 
+            if branching:
+                await self._branch_store.publish(
+                    _scope_thread_id(context.response_id, context),
+                    stream,
+                    checkpoint_ref,
+                    paused=bool(new_pending),
+                )
             yield stream.emit_completed(usage=usage.response_usage)
+        except BranchingError as exc:
+            logger.exception("LangGraph response branch failed")
+            yield stream.emit_failed(
+                code=exc.code,
+                message=str(exc),
+                usage=usage.response_usage,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("LangGraph response handler failed")
             yield stream.emit_failed(
-                code="internal_error",
-                message=str(exc),
+                code="branch_execution_error" if branching else "internal_error",
+                message="The response branch could not be executed." if branching else str(exc),
                 usage=usage.response_usage,
             )
 
