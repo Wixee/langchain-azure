@@ -434,7 +434,9 @@ class ResponsesHostServer:
             )
             try:
                 config = await self.build_runnable_config(execution.parsed, context)
-                pending = await detect_pending_interrupts(self._graph, config)
+                pending = await detect_pending_interrupts(
+                    self._graph, config, pending_store=self._conversation_chain_store
+                )
                 if pending:
                     await self._prepare_resume_command(
                         execution.parsed, context, pending
@@ -1069,7 +1071,9 @@ class ResponsesHostServer:
                 if recovering:
                     logger.debug("Recovery: replaying request input")
                 # Detect a pause from a previous turn and try to resume it.
-                pending = await detect_pending_interrupts(self._graph, config)
+                pending = await detect_pending_interrupts(
+                    self._graph, config, pending_store=self._conversation_chain_store
+                )
                 if pending:
                     _add_request_hosting_features(HostingFeature.HITL)
                     (
@@ -1113,6 +1117,7 @@ class ResponsesHostServer:
                     durability=self._durability,
                 ),
                 active_interrupts,
+                pending_store=self._conversation_chain_store,
             )
             async for event in stream_graph_to_events(
                 graph_stream,

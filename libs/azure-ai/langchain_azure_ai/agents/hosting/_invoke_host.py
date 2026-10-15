@@ -89,6 +89,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from langchain_azure_ai._api.base import experimental
+from langchain_azure_ai._user_agent import get_user_agent
 from langchain_azure_ai.agents.hosting import (
     HostingFeature,
     _add_process_hosting_features,
@@ -113,6 +114,7 @@ from ._invocation_store import (
     create_invocation_state_store,
 )
 from ._messages import CHECKPOINT_CONFIG_MIGRATION, INTERNAL_SERVER_ERROR
+from ._responses.conversation_chain_store import FoundryConversationChainStore
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +467,9 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
             getattr(graph, "builder", None) is not None
         )
         self._graph_has_checkpointer = _uses_langgraph_checkpointer(graph)
+        self._pending_interrupt_store = FoundryConversationChainStore(
+            get_server_version=get_user_agent
+        )
         if (
             options is not None
             and options.resilient_background
@@ -836,7 +841,9 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
         message: InvocationInput,
         config: RunnableConfig,
     ) -> tuple[Optional[GraphInputT], list[dict[str, Any]]]:
-        pending = await detect_pending_interrupts(self._graph, config)
+        pending = await detect_pending_interrupts(
+            self._graph, config, pending_store=self._pending_interrupt_store
+        )
         if not pending:
             if not isinstance(message, str):
                 raise _HITLRequestError(
@@ -874,7 +881,9 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
     ) -> tuple[GraphOutputT, list[Any]]:
         if not (self._supports_langgraph_stream_modes and self._graph_has_checkpointer):
             output = await self._graph.ainvoke(graph_input, config=config)
-            pending = await detect_pending_interrupts(self._graph, config)
+            pending = await detect_pending_interrupts(
+                self._graph, config, pending_store=self._pending_interrupt_store
+            )
             return output, list(pending)
 
         latest_state: Any = None
@@ -883,9 +892,10 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
             self._graph.astream(
                 graph_input,
                 config=config,
-                stream_mode=["values", "updates"],
+                stream_mode=["values", "updates", "checkpoints"],
             ),
             active_interrupts,
+            pending_store=self._pending_interrupt_store,
         )
         async for chunk in graph_stream:
             mode, payload = _classify_graph_stream_chunk(chunk)
@@ -922,7 +932,9 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
                         getattr(request.state, "user_id", None),
                     )
                 )
-                pending = await detect_pending_interrupts(self._graph, config)
+                pending = await detect_pending_interrupts(
+                    self._graph, config, pending_store=self._pending_interrupt_store
+                )
                 if pending:
                     await self._prepare_resume_command(message, pending)
             except IncompleteResumeError as exc:
@@ -1504,6 +1516,7 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
             graph_stream = track_pending_interrupts(
                 raw_graph_stream,
                 active_interrupts,
+                pending_store=self._pending_interrupt_store,
             )
         else:
             graph_stream = self._graph.astream(
@@ -2038,9 +2051,10 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
                         self._graph.astream(
                             graph_input,
                             config=config,
-                            stream_mode=["messages", "updates"],
+                            stream_mode=["messages", "updates", "checkpoints"],
                         ),
                         active_interrupts,
+                        pending_store=self._pending_interrupt_store,
                     )
                 else:
                     graph_stream = self._graph.astream(
@@ -2065,7 +2079,11 @@ class InvocationsHostServer(Generic[GraphInputT, GraphOutputT]):
                     and self._graph_has_checkpointer
                 ):
                     active_interrupts.extend(
-                        await detect_pending_interrupts(self._graph, config)
+                        await detect_pending_interrupts(
+                            self._graph,
+                            config,
+                            pending_store=self._pending_interrupt_store,
+                        )
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("LangGraph streaming invocation failed")

@@ -249,6 +249,12 @@ partial answers are saved, so retry with the complete batch against the same
 parent. Each paired function/MCP item represents the same interrupt, not two
 separate requests. Interrupts raised later belong to a new batch.
 
+Hosts persist active interrupt IDs by thread, checkpoint namespace, and checkpoint
+ID in hosting state storage. This distinguishes a completed node returning `{}`
+from a node that pauses again, including after host recreation. Older checkpoints
+without an active-set record retain task-result inference. This tracking does not
+provide transactional or exactly-once node execution.
+
 Already-admitted queued turns are checked again when execution starts. If they
 are incomplete for the then-current checkpoint, their terminal result reports
 `invalid_request_error`; an HTTP response already sent cannot become a 400.

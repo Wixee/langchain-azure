@@ -54,7 +54,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final, TypeGuard
 
@@ -74,6 +74,8 @@ from .._messages import MISSING_FUNCTION_OUTPUT, MISSING_MCP_APPROVAL
 
 if TYPE_CHECKING:
     from langgraph.types import StateSnapshot
+
+    from .._responses.conversation_chain_store import ConversationChainStoreProtocol
 
 logger = logging.getLogger(__name__)
 _HITL_DECISIONS: Final = frozenset({"approve", "edit", "reject", "respond"})
@@ -143,26 +145,47 @@ class IncompleteResumeError(ValueError):
         }
 
 
+def _interrupt_checkpoint_key(config: Mapping[str, Any]) -> tuple[str, str] | None:
+    configurable = config.get("configurable")
+    if not isinstance(configurable, dict):
+        return None
+    thread_id = configurable.get("thread_id")
+    checkpoint_id = configurable.get("checkpoint_id")
+    namespace = configurable.get("checkpoint_ns", "")
+    if not (
+        isinstance(thread_id, str)
+        and isinstance(checkpoint_id, str)
+        and isinstance(namespace, str)
+    ):
+        return None
+    checkpoint_key = hashlib.sha256(
+        json.dumps((namespace, checkpoint_id)).encode("utf-8")
+    ).hexdigest()
+    return thread_id, f"pending_interrupts_v1_{checkpoint_key}"
+
+
 async def detect_pending_interrupts(
-    graph: Runnable[Any, Any], config: RunnableConfig
+    graph: Runnable[Any, Any],
+    config: RunnableConfig,
+    *,
+    pending_store: ConversationChainStoreProtocol | None = None,
 ) -> tuple[Interrupt, ...]:
     """Return the interrupts pending on the checkpointed state, if any.
 
     ``StateSnapshot.interrupts`` accumulates every interrupt recorded on the
     checkpoint and is *not* pruned as they are answered, so after a partial
     resume of parallel interrupts it may still report the ones already
-    satisfied. Deriving the list from ``StateSnapshot.tasks`` and skipping
-    tasks that produced node output keeps the initial lookup aligned with
-    what is outstanding in the common case. A node pausing again after a
-    resume can have an empty result dictionary. If no result-less tasks
-    remain, only these empty dictionaries are considered, not completed
-    siblings with other results. After a graph invocation,
-    :func:`track_pending_interrupts` provides the authoritative active set.
+    satisfied. When available, use the active IDs recorded by
+    :func:`track_pending_interrupts` for the exact thread, namespace, and
+    checkpoint. Empty node results cannot distinguish a completed sibling
+    from a node that pauses again. Older checkpoints without a record retain
+    the task-result inference used before active sets were persisted.
 
     Args:
         graph: The runnable to inspect. Runnables without an ``aget_state``
             method have no checkpointed interrupts and return an empty tuple.
         config: The :class:`RunnableConfig` identifying the thread.
+        pending_store: Optional persistence for authoritative active IDs.
 
     Returns:
         A tuple of :class:`Interrupt` objects (empty when none pending or
@@ -171,6 +194,7 @@ async def detect_pending_interrupts(
     Raises:
         Exception: If reading checkpoint state fails. A failed lookup must not
             bypass continuation validation.
+        ValueError: Stored active IDs do not exist on the selected checkpoint.
     """
     get_state = getattr(graph, "aget_state", None)
     checkpointer = getattr(graph, "checkpointer", True)
@@ -180,28 +204,47 @@ async def detect_pending_interrupts(
     if snapshot is None:
         return ()
     tasks = tuple(getattr(snapshot, "tasks", None) or ())
-    pending_tasks = tuple(
-        task for task in tasks if getattr(task, "result", None) is None
-    )
-    if not pending_tasks:
+    active_ids: dict[str, str] | None = None
+    snapshot_config = getattr(snapshot, "config", None)
+    if pending_store is not None and isinstance(snapshot_config, dict):
+        checkpoint_key = _interrupt_checkpoint_key(snapshot_config)
+        if checkpoint_key is not None:
+            active_ids = await pending_store.get(*checkpoint_key)
+    if active_ids is not None:
+        pending_tasks = tasks
+    else:
         pending_tasks = tuple(
-            task
-            for task in tasks
-            if isinstance(result := getattr(task, "result", None), dict) and not result
+            task for task in tasks if getattr(task, "result", None) is None
         )
+        if not pending_tasks:
+            pending_tasks = tuple(
+                task
+                for task in tasks
+                if isinstance(result := getattr(task, "result", None), dict)
+                and not result
+            )
 
     seen: set[str] = set()
     pending: list[Interrupt] = []
     for task in pending_tasks:
         for it in getattr(task, "interrupts", None) or ():
-            if isinstance(it, Interrupt) and it.id not in seen:
+            if (
+                isinstance(it, Interrupt)
+                and it.id not in seen
+                and (active_ids is None or it.id in active_ids)
+            ):
                 seen.add(it.id)
                 pending.append(it)
+    if active_ids is not None and seen != set(active_ids):
+        raise ValueError("Stored pending interrupts do not match the checkpoint.")
     return tuple(pending)
 
 
 async def track_pending_interrupts(
-    graph_stream: AsyncIterator[Any], pending: list[Interrupt]
+    graph_stream: AsyncIterator[Any],
+    pending: list[Interrupt],
+    *,
+    pending_store: ConversationChainStoreProtocol | None = None,
 ) -> AsyncIterator[Any]:
     """Pass through a graph stream while recording its active interrupts.
 
@@ -213,13 +256,27 @@ async def track_pending_interrupts(
         graph_stream: A multi-mode LangGraph stream containing ``updates``.
         pending: Mutable output list containing the interrupts observed during
             this invocation, deduplicated by id.
+        pending_store: Optional persistence for active IDs on the last streamed
+            checkpoint. Records are written only after normal stream exhaustion.
 
     Yields:
         Every input chunk unchanged and in its original order.
+
+    Raises:
+        Exception: If the graph stream or active-set persistence fails.
     """
     active_by_id: dict[str, Interrupt] = {}
+    checkpoint_key: tuple[str, str] | None = None
     pending.clear()
     async for chunk in graph_stream:
+        if (
+            isinstance(chunk, tuple)
+            and len(chunk) == 2
+            and chunk[0] == "checkpoints"
+            and isinstance(chunk[1], dict)
+            and isinstance(checkpoint_config := chunk[1].get("config"), dict)
+        ):
+            checkpoint_key = _interrupt_checkpoint_key(checkpoint_config)
         if (
             isinstance(chunk, tuple)
             and len(chunk) == 2
@@ -239,6 +296,10 @@ async def track_pending_interrupts(
             )
             pending[:] = active_by_id.values()
         yield chunk
+    if pending_store is not None and checkpoint_key is not None:
+        await pending_store.set(
+            *checkpoint_key, {interrupt_id: "" for interrupt_id in active_by_id}
+        )
 
 
 def interrupt_arguments_json(interrupt: Interrupt) -> str:

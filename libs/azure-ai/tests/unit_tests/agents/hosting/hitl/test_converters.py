@@ -10,7 +10,7 @@ objects and Responses-API items — no graph and no host involved.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -24,8 +24,8 @@ from azure.ai.agentserver.responses.models import (
     ItemFunctionToolCall,
     MCPApprovalResponse,
 )
-from langchain_core.runnables import RunnableLambda
-from langgraph.types import Command
+from langchain_core.runnables import RunnableConfig, RunnableLambda
+from langgraph.types import Command, Interrupt
 
 from langchain_azure_ai.agents.hosting._converters import (
     HITL_FUNCTION_NAME,
@@ -38,6 +38,9 @@ from langchain_azure_ai.agents.hosting._converters import (
     parse_resume_command,
     track_pending_interrupts,
     validate_approval_responses,
+)
+from langchain_azure_ai.agents.hosting._responses.conversation_chain_store import (
+    FoundryConversationChainStore,
 )
 
 from .conftest import emitted_items, pending_interrupt
@@ -148,6 +151,128 @@ async def test_track_pending_interrupts_passes_through_and_accumulates() -> None
 
     assert passed_through == chunks
     assert pending == [first, refreshed_second]
+
+
+@pytest.mark.parametrize("scope_key", ["thread_id", "checkpoint_ns", "checkpoint_id"])
+@pytest.mark.parametrize("active_ids", [("a" * 32,), ("a" * 32, "b" * 32), ()])
+async def test_recorded_pending_interrupts_are_checkpoint_scoped(
+    scope_key: str, active_ids: tuple[str, ...]
+) -> None:
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "thread",
+            "checkpoint_ns": "namespace",
+            "checkpoint_id": "checkpoint",
+        }
+    }
+    interrupts = tuple(pending_interrupt(id=key) for key in ("a" * 32, "b" * 32))
+    active = tuple(item for item in interrupts if item.id in active_ids)
+    chunks = [
+        ("checkpoints", {"config": config}),
+        ("updates", {"__interrupt__": active}),
+    ]
+
+    async def graph_stream() -> AsyncIterator[Any]:
+        for chunk in chunks:
+            yield chunk
+
+    pending: list[Interrupt] = []
+    assert [
+        chunk
+        async for chunk in track_pending_interrupts(
+            graph_stream(), pending, pending_store=FoundryConversationChainStore()
+        )
+    ] == chunks
+    graph = MagicMock()
+    tasks = tuple(SimpleNamespace(result={}, interrupts=(item,)) for item in interrupts)
+    graph.aget_state = AsyncMock(
+        return_value=SimpleNamespace(config=config, tasks=tasks)
+    )
+    store = FoundryConversationChainStore()
+    detected = await detect_pending_interrupts(graph, config, pending_store=store)
+    assert detected == active
+    if len(detected) > 1:
+        with pytest.raises(
+            IncompleteResumeError, match=f"function call {detected[1].id}"
+        ):
+            parse_resume_command([_tool_output(detected[0].id, "A")], detected)
+
+    other_config: RunnableConfig = {"configurable": dict(config["configurable"])}
+    other_config["configurable"][scope_key] = "another-value"
+    graph.aget_state.return_value = SimpleNamespace(config=other_config, tasks=tasks)
+    assert (
+        await detect_pending_interrupts(graph, other_config, pending_store=store)
+        == interrupts
+    )
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+async def test_pending_interrupt_record_failures_propagate(operation: str) -> None:
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "thread", "checkpoint_id": "checkpoint"}
+    }
+    failure = RuntimeError("interrupt state storage unavailable")
+    store = MagicMock()
+    store.get = AsyncMock(side_effect=failure)
+    store.set = AsyncMock(side_effect=failure)
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(return_value=SimpleNamespace(config=config, tasks=()))
+
+    async def graph_stream() -> AsyncIterator[Any]:
+        yield "checkpoints", {"config": config}
+
+    with pytest.raises(RuntimeError) as error:
+        if operation == "read":
+            await detect_pending_interrupts(graph, config, pending_store=store)
+        else:
+            pending: list[Interrupt] = []
+            async for chunk in track_pending_interrupts(
+                graph_stream(), pending, pending_store=store
+            ):
+                pass
+    assert error.value is failure
+
+
+@pytest.mark.parametrize("exit_mode", ["error", "close"])
+async def test_interrupted_stream_does_not_persist_partial_active_set(
+    exit_mode: str,
+) -> None:
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "thread", "checkpoint_id": "checkpoint"}
+    }
+    store = MagicMock()
+    store.set = AsyncMock()
+
+    async def graph_stream() -> AsyncIterator[Any]:
+        yield "checkpoints", {"config": config}
+        yield "updates", {"__interrupt__": (pending_interrupt(),)}
+        raise RuntimeError("graph stream failed")
+
+    pending: list[Interrupt] = []
+    tracked = track_pending_interrupts(graph_stream(), pending, pending_store=store)
+    if exit_mode == "error":
+        with pytest.raises(RuntimeError, match="graph stream failed"):
+            async for chunk in tracked:
+                pass
+    else:
+        await anext(tracked)
+        await anext(tracked)
+        assert isinstance(tracked, AsyncGenerator)
+        await tracked.aclose()
+    store.set.assert_not_awaited()
+
+
+async def test_recorded_pending_interrupts_must_exist_on_checkpoint() -> None:
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "thread", "checkpoint_id": "checkpoint"}
+    }
+    store = MagicMock()
+    store.get = AsyncMock(return_value={"missing-interrupt": ""})
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(return_value=SimpleNamespace(config=config, tasks=()))
+
+    with pytest.raises(ValueError, match="do not match the checkpoint"):
+        await detect_pending_interrupts(graph, config, pending_store=store)
 
 
 def _sentinel_call(call_id: str, value: str = "Where are you?") -> ItemFunctionToolCall:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from contextlib import ExitStack
 from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -181,8 +182,15 @@ def test_incomplete_resume_returns_400_without_advancing_checkpoint(
 
 @pytest.mark.parametrize("protocol", ["responses", "invocations"])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("task_backed", [False, True])
+@pytest.mark.parametrize("empty_update", [False, True])
+@pytest.mark.parametrize("recreate_host", [False, True])
 def test_sequential_interrupt_excludes_completed_parallel_branch(
-    protocol: str, stream: bool
+    protocol: str,
+    stream: bool,
+    task_backed: bool,
+    empty_update: bool,
+    recreate_host: bool,
 ) -> None:
     answers: list[tuple[str, str]] = []
     completed: list[str] = []
@@ -196,6 +204,8 @@ def test_sequential_interrupt_excludes_completed_parallel_branch(
     def branch_b(state: MessagesState) -> dict[str, Any]:
         answer = interrupt("B1")
         completed.append(answer)
+        if empty_update:
+            return {}
         return {"messages": [AIMessage(content=f"b={answer}")]}
 
     builder = StateGraph(MessagesState)
@@ -204,23 +214,29 @@ def test_sequential_interrupt_excludes_completed_parallel_branch(
     for node_name in ("a", "b"):
         builder.add_edge(START, node_name)
         builder.add_edge(node_name, END)
-    graph = builder.compile(checkpointer=InMemorySaver())
-    session_id = f"sequential-parallel-{protocol}-{stream}"
-    app: ASGIApp
+    checkpointer = InMemorySaver()
+    graph = builder.compile(checkpointer=checkpointer)
+    options = ResponsesServerOptions(steerable_conversations=task_backed)
+    session_id = f"sequential-parallel-{protocol}-{stream}-{task_backed}-{empty_update}"
+
+    def make_app() -> ASGIApp:
+        if protocol == "responses":
+            return ResponsesHostServer(graph, options=options, prefix="/v1").app
+        return InvocationsHostServer(graph, options=options).app
+
     if protocol == "responses":
-        app = ResponsesHostServer(graph, prefix="/v1").app
         path = "/v1/responses"
         input_key = "input"
         continuation: dict[str, Any] = {"conversation": {"id": session_id}}
         thread_id = session_id
     else:
-        app = InvocationsHostServer(graph).app
         path = f"/invocations?agent_session_id={session_id}"
         input_key = "message"
         continuation = {}
         thread_id = _internal_session_id(session_id, "")
 
-    with TestClient(app) as client:
+    with ExitStack() as stack:
+        client = stack.enter_context(TestClient(make_app()))
         first = client.post(path, json={input_key: "Ask both.", **continuation})
         assert first.status_code == 200, first.text
         pending = {
@@ -247,6 +263,11 @@ def test_sequential_interrupt_excludes_completed_parallel_branch(
         if protocol == "responses":
             continuation = {"previous_response_id": second.json()["id"]}
 
+        if recreate_host:
+            stack.close()
+            graph = builder.compile(checkpointer=checkpointer)
+            client = stack.enter_context(TestClient(make_app()))
+
         final = client.post(
             path,
             json={
@@ -257,7 +278,10 @@ def test_sequential_interrupt_excludes_completed_parallel_branch(
         )
         assert final.status_code == 200, final.text
         assert answers == [("answer-A1", "answer-A2")]
-        assert completed == ["answer-B1"]
+        if empty_update or (protocol == "responses" and task_backed):
+            assert set(completed) == {"answer-B1"}
+        else:
+            assert completed == ["answer-B1"]
         assert client.portal is not None
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
         final_state = client.portal.call(graph.aget_state, config)
@@ -684,14 +708,19 @@ def test_execution_revalidates_after_admission(
         lookups = 0
 
         async def pending_after_admission(
-            candidate_graph: CompiledStateGraph, config: RunnableConfig
+            candidate_graph: CompiledStateGraph,
+            config: RunnableConfig,
+            *,
+            pending_store: Any = None,
         ) -> tuple[Interrupt, ...]:
             nonlocal lookups
             lookups += 1
             if lookups == 1:
                 # Model a batch that appears after the request is admitted.
                 return ()
-            return await detect_pending_interrupts(candidate_graph, config)
+            return await detect_pending_interrupts(
+                candidate_graph, config, pending_store=pending_store
+            )
 
         monkeypatch.setattr(
             module, "detect_pending_interrupts", pending_after_admission
