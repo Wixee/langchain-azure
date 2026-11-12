@@ -50,7 +50,7 @@ body:
       options:
         - Chat Models (AzureAIChatCompletionsModel)
         - Chat Models (AzureChatOpenAI)
-        - Embeddings (AzureAIEmbeddingsModel)
+        - Embeddings (AzureAIOpenAIApiEmbeddingsModel)
         - Vector Stores (AzureSearch / AI Search)
         - Vector Stores (AzureCosmosDBNoSqlVectorSearch)
         - Vector Stores (AzureCosmosDBMongoVCoreVectorSearch)

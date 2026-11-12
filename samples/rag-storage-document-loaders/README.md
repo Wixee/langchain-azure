@@ -18,7 +18,7 @@ This demo creates a RAG agent that responds to queries based on documents loaded
    dotenv set AZURE_STORAGE_CONTAINER_NAME "your-container-name"
    dotenv set AZURE_STORAGE_BLOB_PREFIX "your-blob-prefix"  # Defaults to `None`
    dotenv set AZURE_EMBEDDING_MODEL "your-embedding-model"
-   dotenv set AZURE_EMBEDDING_ENDPOINT "https://<your-azure-foundry-resource-name>.openai.azure.com/openai/deployments/<your-embedding-model>"
+   dotenv set AZURE_EMBEDDING_ENDPOINT "https://<your-azure-foundry-resource-name>.openai.azure.com/openai/v1"
    dotenv set AZURE_CHAT_MODEL "your-chat-model"
    dotenv set AZURE_CHAT_ENDPOINT "https://<your-azure-foundry-resource-name>.openai.azure.com/openai/deployments/<your-chat-model>"
    dotenv set AZURE_AI_SEARCH_ENDPOINT "https://<your-azure-search-resource-name>.search.windows.net"

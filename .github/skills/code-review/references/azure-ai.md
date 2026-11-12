@@ -67,7 +67,7 @@ delegation trap.
 
 ## Versioned and deprecated APIs
 
-The `v1` extra only supplies deprecated `azure-ai-inference` chat and embedding
+The `v1` extra only supplies deprecated `azure-ai-inference` chat
 models. Agent Service V1 support has been removed; new agent functionality belongs
 in the current V2 implementation. Deprecations in this package use the local
 `langchain_azure_ai._api.base` decorators (`deprecated`, `experimental`), not

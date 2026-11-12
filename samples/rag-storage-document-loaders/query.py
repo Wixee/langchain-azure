@@ -6,7 +6,7 @@ import warnings
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
-from langchain_azure_ai.embeddings import AzureAIEmbeddingsModel
+from langchain_azure_ai.embeddings import AzureAIOpenAIApiEmbeddingsModel
 from langchain_azure_ai.vectorstores import AzureSearch
 from langchain_community.vectorstores.azuresearch import AzureSearchVectorStoreRetriever
 
@@ -33,11 +33,10 @@ def get_chat_model() -> AzureAIChatCompletionsModel:
 
 def get_azure_search() -> AzureSearch:
     """Initialize and return the Azure Search vector store."""
-    embed_model = AzureAIEmbeddingsModel(
+    embed_model = AzureAIOpenAIApiEmbeddingsModel(
         endpoint=os.environ["AZURE_EMBEDDING_ENDPOINT"],
         credential=_CREDENTIAL,
         model=os.environ["AZURE_EMBEDDING_MODEL"],
-        client_kwargs=_COGNITIVE_CREDENTIAL_SCOPES.copy(),
     )
     azure_search = AzureSearch(
         azure_search_endpoint=os.environ["AZURE_AI_SEARCH_ENDPOINT"],

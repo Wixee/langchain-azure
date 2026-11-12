@@ -41,7 +41,7 @@ install the `hosting` extra:
 pip install -U langchain-azure-ai[hosting]
 ```
 
-For the deprecated Azure AI Inference chat and embedding models, use the `v1`
+For the deprecated Azure AI Inference chat models, use the `v1`
 extra. This extra no longer provides Agent Service V1 support.
 
 ```bash
@@ -132,6 +132,11 @@ document_vectors = embeddings.embed_documents(
 )
 ```
 
+**Breaking change:** The deprecated `AzureAIEmbeddingsModel` and the
+`langchain_azure_ai.embeddings.inference` module have been removed. Use
+`AzureAIOpenAIApiEmbeddingsModel` with an OpenAI-compatible endpoint as shown
+above.
+
 <a id="microsoft-foundry-agent-service"></a>
 
 ### Accessing agents on Microsoft Foundry Agent Service
@@ -206,7 +211,7 @@ in version 1.1.0. Use `AgentServiceFactory` and `AgentServiceAgentState` from
 The current implementation uses `azure-ai-projects` and Responses/Conversations
 instead of the V1 threads/runs APIs. Update agent creation, graph state, and tool
 configuration for V2 rather than aliasing the removed imports. The `v1` extra
-remains available only for deprecated Azure AI Inference models.
+remains available only for deprecated Azure AI Inference chat models.
 
 ### Applying Content Safety guardrails via middleware
 

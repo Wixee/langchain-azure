@@ -50,7 +50,7 @@ class AzureAIOpenAIApiEmbeddingsModel(OpenAIEmbeddings):
     **Direct endpoint + API-key pattern:**
 
     ```python
-    from langchain_azure_ai.embeddings import AzureAIEmbeddingsModel
+    from langchain_azure_ai.embeddings import AzureAIOpenAIApiEmbeddingsModel
 
     embed_model = AzureAIOpenAIApiEmbeddingsModel(
         endpoint="https://resource.services.ai.azure.com/openai/v1",

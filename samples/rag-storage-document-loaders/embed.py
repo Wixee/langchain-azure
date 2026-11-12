@@ -5,7 +5,7 @@ import warnings
 
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
-from langchain_azure_ai.embeddings import AzureAIEmbeddingsModel
+from langchain_azure_ai.embeddings import AzureAIOpenAIApiEmbeddingsModel
 from langchain_azure_ai.vectorstores import AzureSearch
 from langchain_community.document_loaders import PyPDFLoader
 
@@ -42,11 +42,10 @@ def main() -> None:
         chunk_overlap=500,
     )
 
-    embed_model = AzureAIEmbeddingsModel(
+    embed_model = AzureAIOpenAIApiEmbeddingsModel(
         endpoint=os.environ["AZURE_EMBEDDING_ENDPOINT"],
         credential=_CREDENTIAL,
         model=os.environ["AZURE_EMBEDDING_MODEL"],
-        client_kwargs=_COGNITIVE_CREDENTIAL_SCOPES.copy(),
     )
 
     azure_search = AzureSearch(

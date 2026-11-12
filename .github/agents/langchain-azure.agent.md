@@ -94,7 +94,7 @@ langchain_azure_ai/
 ├── callbacks/tracers/       # OpenTelemetry tracing
 ├── chat_history/            # Chat message history (Cosmos DB, AI Memory)
 ├── chat_models/             # Chat completions (OpenAI-compatible, Inference SDK)
-├── embeddings/              # Embeddings (OpenAI-compatible, Inference SDK)
+├── embeddings/              # Embeddings (OpenAI-compatible)
 ├── query_constructors/      # Cosmos DB NoSQL query translation
 ├── retrievers/              # Azure AI Search, AI Memory retrievers
 ├── tools/                   # AI services tools + toolkit
@@ -176,9 +176,8 @@ V2 supports middleware (`AgentMiddleware` with `before_agent`, `after_agent`, `w
 
 #### Deprecated Classes
 
-The following classes use the legacy `azure-ai-inference` SDK and are deprecated:
+The following class uses the legacy `azure-ai-inference` SDK and is deprecated:
 - `AzureAIChatCompletionsModel` (use `AzureAIOpenAIApiChatModel`)
-- `AzureAIEmbeddingsModel` (use `AzureAIOpenAIApiEmbeddingsModel`)
 
 ---
 
@@ -409,7 +408,7 @@ LangChain integrations extend the appropriate LangChain base class; LangGraph ch
 ### Optional Dependencies
 
 In `langchain-azure-ai`, heavy SDKs are gated behind extras in `pyproject.toml`:
-- `v1`: `azure-ai-inference` for deprecated chat and embedding models only
+- `v1`: `azure-ai-inference` for deprecated chat models only
 - `opentelemetry`: Azure Monitor + OpenTelemetry stack
 - `tools`: `azure-ai-documentintelligence`, `azure-ai-textanalytics`, `azure-ai-vision-imageanalysis`, `azure-logicapps-connector`
 
